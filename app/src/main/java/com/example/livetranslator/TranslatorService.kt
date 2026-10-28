@@ -28,6 +28,7 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
 import com.google.mlkit.nl.translate.Translation
@@ -41,7 +42,9 @@ import kotlin.math.abs
  *
  * Bubble menu:
  *  - live translation (Gemini API or offline Vosk + ML Kit)
- *  - record the audio and get a detailed translation from Gemini afterwards
+ *  - record the video's audio once; Gemini returns timed, speaker-labelled translation (a "session")
+ *  - follow a saved session: when the video is replayed, the audio fingerprint tells where we are
+ *    and the matching line is shown with the speaker name
  *  - stop
  */
 class TranslatorService : Service() {
@@ -69,9 +72,11 @@ class TranslatorService : Service() {
     @Volatile private var alive = false
     @Volatile private var liveWanted = false
     @Volatile private var recordingWanted = false
+    @Volatile private var followWanted = false
     private val sinkLock = Any()
     private var liveSink: AudioSink? = null
-    private var recorder: WavRecorder? = null
+    private var recorder: SessionRecorder? = null
+    private var followSink: FollowSink? = null
     private var recordFile: File? = null
 
     // views
@@ -79,6 +84,7 @@ class TranslatorService : Service() {
     private var subtitleBox: View? = null
     private var bubble: View? = null
     private var menu: View? = null
+    private lateinit var spView: TextView
     private lateinit var arView: TextView
     private lateinit var enView: TextView
 
@@ -90,10 +96,47 @@ class TranslatorService : Service() {
     private var lastTranslated = ""
     private var lastTranslateAt = 0L
 
+    // follow mode
+    private var syncMs = 0
+    private var followShown = false
+    private val speakerColors = intArrayOf(
+        0xFF8AB4F8.toInt(), 0xFFF28B82.toInt(), 0xFF81C995.toInt(), 0xFFFDD663.toInt(), 0xFFC58AF9.toInt()
+    )
+
     private val clearRunnable = Runnable {
         if (::arView.isInitialized) {
             arView.text = ""
             enView.text = ""
+            spView.visibility = View.GONE
+        }
+    }
+
+    private val followTick = object : Runnable {
+        override fun run() {
+            if (!followWanted) return
+            val sink = synchronized(sinkLock) { followSink }
+            val pos = sink?.position()
+            var found: Segment? = null
+            var idx = 0
+            if (pos != null) {
+                val session = pos.first
+                val t = pos.second + syncMs / 1000.0
+                for (s in session.segments) {
+                    if (t >= s.start - 0.15 && t <= s.end + 0.5) found = s
+                }
+                val f = found
+                if (f != null) idx = session.speakers.indexOf(f.speaker).coerceAtLeast(0)
+            }
+            val seg = found
+            if (seg != null) {
+                showSegment(seg, idx)
+            } else if (followShown) {
+                followShown = false
+                arView.text = ""
+                enView.text = ""
+                spView.visibility = View.GONE
+            }
+            main.postDelayed(this, 250)
         }
     }
 
@@ -133,6 +176,7 @@ class TranslatorService : Service() {
         projectionCallback = cb
         proj.registerCallback(cb, main)
 
+        syncMs = Prefs.syncMs(this)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         showSubtitleBar()
         showBubble()
@@ -191,6 +235,12 @@ class TranslatorService : Service() {
                 cornerRadius = 16 * dp
             }
         }
+        spView = TextView(this).apply {
+            textSize = 13f
+            gravity = Gravity.CENTER
+            textDirection = View.TEXT_DIRECTION_RTL
+            visibility = View.GONE
+        }
         arView = TextView(this).apply {
             setTextColor(Color.WHITE)
             textSize = 20f
@@ -203,6 +253,7 @@ class TranslatorService : Service() {
             textSize = 13f
             gravity = Gravity.CENTER
         }
+        box.addView(spView)
         box.addView(arView)
         box.addView(enView)
 
@@ -223,6 +274,7 @@ class TranslatorService : Service() {
 
     private fun setStatus(msg: String) {
         main.removeCallbacks(clearRunnable)
+        spView.visibility = View.GONE
         arView.text = msg
         enView.text = ""
     }
@@ -232,10 +284,25 @@ class TranslatorService : Service() {
     }
 
     private fun showPair(en: String, ar: String) {
+        spView.visibility = View.GONE
         enView.text = en
         arView.text = ar
         main.removeCallbacks(clearRunnable)
         main.postDelayed(clearRunnable, 9000)
+    }
+
+    private fun showSegment(seg: Segment, speakerIdx: Int) {
+        main.removeCallbacks(clearRunnable)
+        if (seg.speaker.isNotBlank()) {
+            spView.text = seg.speaker
+            spView.setTextColor(speakerColors[speakerIdx % speakerColors.size])
+            spView.visibility = View.VISIBLE
+        } else {
+            spView.visibility = View.GONE
+        }
+        arView.text = seg.ar
+        enView.text = seg.en
+        followShown = true
     }
 
     // ---------- Floating bubble + menu ----------
@@ -359,12 +426,19 @@ class TranslatorService : Service() {
         addItem(if (liveWanted) "إيقاف الترجمة الحية" else "ترجمة حية") {
             if (liveWanted) stopLive() else startLive()
         }
-        addItem(if (recordingWanted) "إيقاف التسجيل وترجم" else "سجّل وترجم") {
+        addItem(if (recordingWanted) "إيقاف التسجيل وحفظ" else "سجّل وترجم (حفظ)") {
             if (recordingWanted) stopRecordingAndTranslate() else startRecording()
+        }
+        addItem(if (followWanted) "إيقاف المتابعة" else "متابعة ترجمة محفوظة") {
+            if (followWanted) stopFollow() else startFollow()
+        }
+        if (followWanted) {
+            addItem("الترجمة أبكر (+0.5 ث)") { adjustSync(500) }
+            addItem("الترجمة أبطأ (−0.5 ث)") { adjustSync(-500) }
         }
         addItem("إيقاف التطبيق") { stopSelf() }
 
-        val menuWidth = (180 * dp).toInt()
+        val menuWidth = (190 * dp).toInt()
         val bubbleSize = (52 * dp).toInt()
         val screenW = resources.displayMetrics.widthPixels
         val gap = (6 * dp).toInt()
@@ -387,10 +461,18 @@ class TranslatorService : Service() {
         menu = box
     }
 
+    private fun adjustSync(deltaMs: Int) {
+        syncMs += deltaMs
+        Prefs.setSyncMs(this, syncMs)
+        val sign = if (syncMs > 0) "+" else ""
+        Toast.makeText(this, "ضبط التزامن: $sign${syncMs / 1000.0} ث", Toast.LENGTH_SHORT).show()
+    }
+
     // ---------- Live translation ----------
 
     private fun startLive() {
         if (liveWanted) return
+        if (followWanted) stopFollow()
         val engine = Prefs.liveEngine(this)
         val key = Prefs.apiKey(this)
         if (engine == Prefs.ENGINE_GEMINI && key.isBlank()) {
@@ -480,6 +562,7 @@ class TranslatorService : Service() {
 
     private fun onOfflineSpeech(text: String, isFinal: Boolean) {
         if (!liveWanted) return
+        spView.visibility = View.GONE
         enView.text = text
         val now = SystemClock.elapsedRealtime()
         if (text != lastTranslated && (isFinal || now - lastTranslateAt > 1200)) {
@@ -491,7 +574,7 @@ class TranslatorService : Service() {
         main.postDelayed(clearRunnable, 7000)
     }
 
-    // ---------- Record, then translate in detail ----------
+    // ---------- Record once (session), translate with Gemini ----------
 
     private fun startRecording() {
         if (recordingWanted) return
@@ -501,7 +584,7 @@ class TranslatorService : Service() {
         }
         val f = File(cacheDir, "rec_${System.currentTimeMillis()}.wav")
         val r = try {
-            WavRecorder(f)
+            SessionRecorder(f)
         } catch (e: Exception) {
             setStatus("تعذّر بدء التسجيل")
             return
@@ -509,13 +592,13 @@ class TranslatorService : Service() {
         synchronized(sinkLock) { recorder = r }
         recordFile = f
         recordingWanted = true
-        setStatus("● يسجّل… افتح الفقاعة واختر «إيقاف التسجيل وترجم»")
+        setStatus("● يسجّل… شغّل الفيديو كاملاً ثم اختر «إيقاف التسجيل وحفظ»")
     }
 
     private fun stopRecordingAndTranslate() {
         if (!recordingWanted) return
         recordingWanted = false
-        var r: WavRecorder? = null
+        var r: SessionRecorder? = null
         synchronized(sinkLock) {
             r = recorder
             recorder = null
@@ -524,23 +607,27 @@ class TranslatorService : Service() {
         rec?.close()
         val f = recordFile
         recordFile = null
-        val seconds = rec?.durationSec ?: 0L
-        if (f == null || seconds < 2) {
+        val seconds = rec?.durationSec ?: 0.0
+        if (rec == null || f == null || seconds < 3.0) {
             f?.delete()
             setStatus("التسجيل قصير جداً")
             main.postDelayed(clearRunnable, 2500)
             return
         }
 
-        setStatus("جاري الترجمة المفصلة…")
-        val style = Prefs.style(this)
+        val fpArray = rec.fingerprint()
+        val onsets = rec.onsets()
+        setStatus("جاري التحليل والترجمة…")
         Thread {
             try {
-                val text = FileTranslator.run(this, null, f, style) { msg -> postStatus(msg) }
-                Notifier.result(this, "اكتملت الترجمة", text.take(120))
+                val raw = FileTranslator.runSegments(this, f) { msg -> postStatus(msg) }
+                val segs = SegmentTools.snap(raw, onsets)
+                SessionStore.save(this, segs, seconds, fpArray)
+                val text = SegmentTools.formatText(segs)
+                FileTranslator.lastFile(this).writeText(text)
+                Notifier.result(this, "حُفظت الترجمة", text.take(120))
                 main.post {
-                    setStatus("اكتملت الترجمة ✓")
-                    main.postDelayed(clearRunnable, 3000)
+                    setStatus("حُفظت الجلسة ✓ — عند إعادة الفيديو اختر «متابعة ترجمة محفوظة»")
                     try {
                         startActivity(
                             Intent(this, ResultActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -554,6 +641,66 @@ class TranslatorService : Service() {
                 f.delete()
             }
         }.start()
+    }
+
+    // ---------- Follow a saved session ----------
+
+    private fun startFollow() {
+        if (followWanted) return
+        val sessions = SessionStore.list(this)
+        if (sessions.isEmpty()) {
+            setStatus("لا توجد جلسات محفوظة. استخدم «سجّل وترجم» أولاً")
+            return
+        }
+        if (liveWanted) stopLive()
+        followWanted = true
+        setStatus("أحمّل الجلسات المحفوظة…")
+
+        Thread {
+            var sink: FollowSink? = null
+            try {
+                val loaded = ArrayList<FollowSession>()
+                for (s in sessions) {
+                    try {
+                        loaded.add(FollowSession(s.id, SessionStore.loadFp(this, s.id), s.segments))
+                    } catch (_: Exception) {
+                    }
+                }
+                if (loaded.isNotEmpty()) sink = FollowSink(loaded)
+            } catch (e: Throwable) {
+                postStatus("خطأ: ${e.message}")
+            }
+            main.post {
+                val s = sink
+                if (s == null) {
+                    followWanted = false
+                    setStatus("تعذّر تحميل الجلسات")
+                } else if (followWanted) {
+                    synchronized(sinkLock) { followSink = s }
+                    followShown = false
+                    setStatus("أستمع… شغّل الفيديو من أي نقطة")
+                    main.removeCallbacks(followTick)
+                    main.post(followTick)
+                } else {
+                    Thread { s.close() }.start()
+                }
+            }
+        }.start()
+    }
+
+    private fun stopFollow() {
+        followWanted = false
+        main.removeCallbacks(followTick)
+        var s: FollowSink? = null
+        synchronized(sinkLock) {
+            s = followSink
+            followSink = null
+        }
+        val old = s
+        if (old != null) Thread { old.close() }.start()
+        followShown = false
+        setStatus("توقفت المتابعة")
+        main.postDelayed(clearRunnable, 2500)
     }
 
     // ---------- Audio capture ----------
@@ -588,13 +735,13 @@ class TranslatorService : Service() {
         return true
     }
 
-    /** Reads audio only while something needs it (live translation or recording). */
+    /** Reads audio only while something needs it (live translation, recording or following). */
     private fun captureLoop(rec: AudioRecord) {
         val buf = ShortArray(2048)
         var started = false
         try {
             while (alive) {
-                if (!liveWanted && !recordingWanted) {
+                if (!liveWanted && !recordingWanted && !followWanted) {
                     if (started) {
                         try {
                             rec.stop()
@@ -624,6 +771,10 @@ class TranslatorService : Service() {
                         recorder?.onAudio(buf, n)
                     } catch (_: Exception) {
                     }
+                    try {
+                        followSink?.onAudio(buf, n)
+                    } catch (_: Exception) {
+                    }
                 }
             }
         } catch (_: InterruptedException) {
@@ -643,21 +794,28 @@ class TranslatorService : Service() {
         alive = false
         liveWanted = false
         recordingWanted = false
+        followWanted = false
+        main.removeCallbacks(followTick)
         try {
             captureThread?.join(1000)
         } catch (_: InterruptedException) {
         }
 
         var s: AudioSink? = null
-        var r: WavRecorder? = null
+        var r: SessionRecorder? = null
+        var fs: FollowSink? = null
         synchronized(sinkLock) {
             s = liveSink
             liveSink = null
             r = recorder
             recorder = null
+            fs = followSink
+            followSink = null
         }
         val oldSink = s
         if (oldSink != null) Thread { oldSink.close() }.start()
+        val oldFollow = fs
+        if (oldFollow != null) Thread { oldFollow.close() }.start()
         r?.close()
         recordFile?.delete()
 

@@ -29,6 +29,13 @@ object Prefs {
         return Style.values().getOrElse(i) { Style.DETAILED }
     }
 
+    /** Manual sync correction in milliseconds (positive = subtitles appear earlier). */
+    fun syncMs(ctx: Context): Int = sp(ctx).getInt("sync_ms", 0)
+
+    fun setSyncMs(ctx: Context, v: Int) {
+        sp(ctx).edit().putInt("sync_ms", v).apply()
+    }
+
     fun save(
         ctx: Context,
         apiKey: String,

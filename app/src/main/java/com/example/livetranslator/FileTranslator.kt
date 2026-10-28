@@ -33,6 +33,28 @@ object FileTranslator {
     fun lastFile(ctx: Context): File = File(ctx.filesDir, "last_translation.txt")
 
     /**
+     * Sends a recording to Gemini and returns timed, speaker-labelled segments
+     * (English + Arabic). Blocks, so call it from a background thread.
+     */
+    fun runSegments(ctx: Context, wav: File, onStatus: (String) -> Unit): List<Segment> {
+        val key = Prefs.apiKey(ctx)
+        if (key.isBlank()) throw GeminiException(0, "أدخل مفتاح Gemini API في الإعدادات أولاً")
+
+        onStatus("يرفع التسجيل… 0%")
+        val up = GeminiClient.uploadFile(key, wav, "audio/wav") { pct -> onStatus("يرفع التسجيل… $pct%") }
+
+        onStatus("Gemini يحلل المتحدثين ويترجم… قد يستغرق عدة دقائق")
+        val text = GeminiClient.generate(
+            key,
+            Prefs.fileModel(ctx),
+            listOf(Part.Text(SegmentTools.PROMPT), Part.FileRef(up.uri, "audio/wav", "audio"))
+        )
+        val segs = SegmentTools.parse(text)
+        if (segs.isEmpty()) throw GeminiException(0, "لم يُكتشف كلام في التسجيل")
+        return segs
+    }
+
+    /**
      * Either [wav] (a recording made by the app) or [uri] (a picked/shared file) must be given.
      * Blocks, so call it from a background thread. Returns the Arabic translation.
      */

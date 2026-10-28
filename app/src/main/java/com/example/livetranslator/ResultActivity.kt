@@ -15,6 +15,10 @@ import android.widget.Toast
 /** Shows the last full translation, with copy / share / summary buttons. */
 class ResultActivity : Activity() {
 
+    companion object {
+        const val EXTRA_SESSION = "session"
+    }
+
     private lateinit var body: TextView
     private lateinit var summaryBtn: Button
     private var text = ""
@@ -24,8 +28,14 @@ class ResultActivity : Activity() {
         val dp = resources.displayMetrics.density
         val pad = (16 * dp).toInt()
 
-        val f = FileTranslator.lastFile(this)
-        text = if (f.exists()) f.readText() else ""
+        val sid = intent.getStringExtra(EXTRA_SESSION)
+        text = if (sid != null) {
+            val s = SessionStore.get(this, sid)
+            if (s != null) SegmentTools.formatText(s.segments) else ""
+        } else {
+            val f = FileTranslator.lastFile(this)
+            if (f.exists()) f.readText() else ""
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL

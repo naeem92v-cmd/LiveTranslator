@@ -39,6 +39,7 @@ class MainActivity : Activity() {
     private lateinit var engineGroup: RadioGroup
     private lateinit var radioGemini: RadioButton
     private lateinit var radioOffline: RadioButton
+    private lateinit var sessionsBox: LinearLayout
     private lateinit var styleGroup: RadioGroup
     private val styleButtons = ArrayList<RadioButton>()
 
@@ -172,9 +173,55 @@ class MainActivity : Activity() {
         }
         root.addView(saveBtn)
 
+        root.addView(label("الجلسات المحفوظة", 18f, 24))
+        sessionsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(sessionsBox)
+
         val scroll = ScrollView(this)
         scroll.addView(root)
         setContentView(scroll)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        refreshSessions()
+    }
+
+    private fun refreshSessions() {
+        sessionsBox.removeAllViews()
+        val list = SessionStore.list(this)
+        if (list.isEmpty()) {
+            sessionsBox.addView(label("لا توجد جلسات بعد. من الفقاعة اختر «سجّل وترجم (حفظ)».", 13f, 4))
+            return
+        }
+        for (s in list) {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+            }
+            val t = TextView(this).apply {
+                text = s.title
+                textSize = 14f
+                textDirection = View.TEXT_DIRECTION_RTL
+                setOnClickListener {
+                    startActivity(
+                        Intent(this@MainActivity, ResultActivity::class.java)
+                            .putExtra(ResultActivity.EXTRA_SESSION, s.id)
+                    )
+                }
+            }
+            t.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            val d = Button(this).apply {
+                text = "حذف"
+                setOnClickListener {
+                    SessionStore.delete(this@MainActivity, s.id)
+                    refreshSessions()
+                }
+            }
+            row.addView(t)
+            row.addView(d)
+            sessionsBox.addView(row)
+        }
     }
 
     private fun loadSettings() {

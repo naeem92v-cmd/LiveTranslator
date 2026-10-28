@@ -150,7 +150,7 @@ object GeminiClient {
         try {
             conn.requestMethod = "POST"
             conn.connectTimeout = 15000
-            conn.readTimeout = 180000
+            conn.readTimeout = 480000
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.setRequestProperty("x-goog-api-key", apiKey)
