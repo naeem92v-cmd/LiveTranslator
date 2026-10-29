@@ -19,13 +19,46 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # NDK + CMake for the whisper.cpp engine
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;26.1.10909125" "cmake;3.22.1"
+
       # No Gradle wrapper in the repo, so install Gradle directly
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.9
 
+      # One fixed signing key, created on the first build and committed back to the repo,
+      # so every later APK installs as an update (keeps settings and saved sessions).
+      # Only in a private repo: in a public one anyone could take the key, so that build
+      # uses a throwaway key and the APK will not install over the previous one.
+      - name: Create the signing key (first build only)
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [ ! -f keystore/livetranslator.jks ]; then
+            mkdir -p keystore
+            keytool -genkeypair -keystore keystore/livetranslator.jks -storetype JKS -storepass livetranslator -keypass livetranslator -alias livetranslator -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=LiveTranslator"
+            if [ "$REPO_PRIVATE" = "true" ]; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+              git add keystore/livetranslator.jks
+              git commit -m "Add fixed signing key [skip ci]"
+              git push
+            else
+              echo "::warning::The repo is public, so the signing key was not saved. Make the repo private to get installable updates."
+            fi
+          fi
+
       - name: Build debug APK
         run: gradle assembleDebug --no-daemon
+
+      # Tests do not block the APK: a failure shows as a warning in the Actions run
+      - name: Unit tests
+        continue-on-error: true
+        run: gradle testDebugUnitTest --no-daemon
 
       - uses: actions/upload-artifact@v4
         with:

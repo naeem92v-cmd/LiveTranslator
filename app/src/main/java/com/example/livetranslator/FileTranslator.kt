@@ -9,13 +9,14 @@ import android.content.Intent
 import android.net.Uri
 import java.io.File
 
-enum class Style { DETAILED, TIMESTAMPS, SUMMARY }
+/** SESSION: timed lines + fingerprint, so the video can be followed later (added last: ordinals are saved). */
+enum class Style { DETAILED, TIMESTAMPS, SUMMARY, SESSION }
 
 /** Translates a whole audio/video file through the Gemini API (upload -> translate). */
 object FileTranslator {
 
     private fun prompt(style: Style): String = when (style) {
-        Style.DETAILED ->
+        Style.DETAILED, Style.SESSION ->
             "Translate everything that is said in this recording into Arabic, in full and in detail. " +
                 "Do not summarize or skip anything. Keep names, numbers and technical terms accurate " +
                 "and write natural, clear Arabic. If the speech is not English, name the language first. " +
@@ -36,22 +37,115 @@ object FileTranslator {
      * Sends a recording to Gemini and returns timed, speaker-labelled segments
      * (English + Arabic). Blocks, so call it from a background thread.
      */
-    fun runSegments(ctx: Context, wav: File, onStatus: (String) -> Unit): List<Segment> {
+    fun runSegments(
+        ctx: Context,
+        wav: File,
+        durationSec: Double,
+        onsets: List<Double>,
+        onStatus: (String) -> Unit
+    ): List<Segment> {
         val key = Prefs.apiKey(ctx)
         if (key.isBlank()) throw GeminiException(0, "أدخل مفتاح Gemini API في الإعدادات أولاً")
 
-        onStatus("يرفع التسجيل… 0%")
-        val up = GeminiClient.uploadFile(key, wav, "audio/wav") { pct -> onStatus("يرفع التسجيل… $pct%") }
+        // Long recordings go in parts of ~10 minutes (the reply length is limited)
+        val cuts = SegmentTools.chooseCuts(durationSec, onsets)
+        val bounds = listOf(0.0) + cuts + listOf(durationSec)
+        val parts = bounds.size - 1
+        val out = ArrayList<Segment>()
+        for (i in 0 until parts) {
+            val label = if (parts > 1) " (الجزء ${i + 1} من $parts)" else ""
+            val partFile = if (parts > 1) {
+                File(ctx.cacheDir, "part_${System.currentTimeMillis()}_$i.wav").also {
+                    AudioUtil.sliceWav(wav, bounds[i], bounds[i + 1], it)
+                }
+            } else {
+                wav
+            }
+            try {
+                onStatus("يرفع التسجيل$label… 0%")
+                val up = GeminiClient.uploadFile(key, partFile, "audio/wav") { pct ->
+                    onStatus("يرفع التسجيل$label… $pct%")
+                }
+                onStatus("Gemini يحلل المتحدثين ويترجم$label… قد يستغرق عدة دقائق")
+                val text = generateWithRetry(
+                    key,
+                    Prefs.fileModel(ctx),
+                    listOf(
+                        Part.Text(SegmentTools.PROMPT + Prefs.glossaryHint(ctx)),
+                        Part.FileRef(up.uri, "audio/wav", "audio")
+                    )
+                )
+                out.addAll(SegmentTools.shift(SegmentTools.parse(text), bounds[i]))
+            } finally {
+                if (partFile != wav) partFile.delete()
+            }
+        }
+        if (out.isEmpty()) throw GeminiException(0, "لم يُكتشف كلام في التسجيل")
+        out.sortBy { it.start }
+        return out
+    }
 
-        onStatus("Gemini يحلل المتحدثين ويترجم… قد يستغرق عدة دقائق")
-        val text = GeminiClient.generate(
-            key,
-            Prefs.fileModel(ctx),
-            listOf(Part.Text(SegmentTools.PROMPT), Part.FileRef(up.uri, "audio/wav", "audio"))
-        )
-        val segs = SegmentTools.parse(text)
-        if (segs.isEmpty()) throw GeminiException(0, "لم يُكتشف كلام في التسجيل")
-        return segs
+    /** Rate limits and busy servers are common on the free tier: wait and try again twice. */
+    private fun generateWithRetry(key: String, model: String, parts: List<Part>): String {
+        var attempt = 0
+        while (true) {
+            try {
+                return GeminiClient.generate(key, model, parts)
+            } catch (e: GeminiException) {
+                if (attempt >= 2 || e.code !in listOf(429, 500, 503)) throw e
+                attempt++
+                Thread.sleep(15000L * attempt)
+            }
+        }
+    }
+
+    /**
+     * Translates a picked/shared file into a session (timed lines + audio fingerprint), so that
+     * playing the same video later can be followed like a recording. Returns the session id.
+     */
+    fun runSession(ctx: Context, uri: Uri, name: String?, onStatus: (String) -> Unit): String {
+        val key = Prefs.apiKey(ctx)
+        if (key.isBlank()) throw GeminiException(0, "أدخل مفتاح Gemini API في الإعدادات أولاً")
+
+        val wav = File(ctx.cacheDir, "file_${System.currentTimeMillis()}.wav")
+        try {
+            val rec = SessionRecorder(wav)
+            // same 2048-sample blocks as the live capture: the onset detector counts blocks
+            val block = ShortArray(2048)
+            var fill = 0
+            val feed = { b: ShortArray, n: Int ->
+                var i = 0
+                while (i < n) {
+                    val c = minOf(n - i, block.size - fill)
+                    System.arraycopy(b, i, block, fill, c)
+                    fill += c
+                    i += c
+                    if (fill == block.size) {
+                        rec.onAudio(block, fill)
+                        fill = 0
+                    }
+                }
+            }
+            onStatus("يحلل صوت الملف… 0%")
+            val ok = try {
+                val decoded = AudioDecoder.decode(ctx, uri, feed) { pct ->
+                    onStatus("يحلل صوت الملف… $pct%")
+                }
+                if (fill > 0) rec.onAudio(block, fill)
+                decoded
+            } finally {
+                rec.close()
+            }
+            if (!ok || rec.durationSec < 3.0) throw GeminiException(0, "تعذّرت قراءة صوت الملف")
+
+            val raw = runSegments(ctx, wav, rec.durationSec, rec.onsets(), onStatus)
+            val segs = SegmentTools.snap(raw, rec.onsets())
+            val id = SessionStore.save(ctx, segs, rec.durationSec, rec.fingerprint(), name)
+            lastFile(ctx).writeText(SegmentTools.formatText(segs))
+            return id
+        } finally {
+            wav.delete()
+        }
     }
 
     /**
@@ -72,10 +166,10 @@ object FileTranslator {
             }
 
             onStatus("Gemini يترجم… قد يستغرق دقيقة")
-            val text = GeminiClient.generate(
+            val text = generateWithRetry(
                 key,
                 Prefs.fileModel(ctx),
-                listOf(Part.Text(prompt(style)), Part.FileRef(uploaded.uri, mime, kind))
+                listOf(Part.Text(prompt(style) + Prefs.glossaryHint(ctx)), Part.FileRef(uploaded.uri, mime, kind))
             )
             if (text.isBlank()) throw GeminiException(0, "لم يرجع Gemini أي نص")
 

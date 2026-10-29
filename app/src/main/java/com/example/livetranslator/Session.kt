@@ -112,6 +112,60 @@ object SegmentTools {
         return out
     }
 
+    /**
+     * Gemini's reply has a length limit, so a long recording is translated in parts of about
+     * [chunkSec]. Each cut is put just before a speech onset (after a pause) near the boundary,
+     * so no sentence is split; without a nearby onset the cut is made at the boundary itself.
+     */
+    fun chooseCuts(
+        durationSec: Double,
+        onsets: List<Double>,
+        chunkSec: Double = 600.0,
+        slack: Double = 60.0
+    ): List<Double> {
+        val cuts = ArrayList<Double>()
+        var last = 0.0
+        while (durationSec - last > chunkSec + slack) {
+            val target = last + chunkSec
+            val near = onsets
+                .filter { it > target - slack && it < target + slack }
+                .minByOrNull { abs(it - target) }
+            val cut = if (near != null) maxOf(near - 0.2, last + 1.0) else target
+            cuts.add(cut)
+            last = cut
+        }
+        return cuts
+    }
+
+    fun shift(segs: List<Segment>, offset: Double): List<Segment> =
+        segs.map { Segment(it.start + offset, it.end + offset, it.speaker, it.en, it.ar) }
+
+    private fun srtTime(t: Double): String {
+        val ms = (t * 1000).toLong().coerceAtLeast(0L)
+        return String.format(
+            Locale.US, "%02d:%02d:%02d,%03d",
+            ms / 3600000, ms / 60000 % 60, ms / 1000 % 60, ms % 1000
+        )
+    }
+
+    /** Standard .srt subtitle file: speaker + Arabic on the first line, original text below. */
+    fun toSrt(segs: List<Segment>): String {
+        val sb = StringBuilder()
+        for ((i, s) in segs.withIndex()) {
+            val nextStart = if (i + 1 < segs.size) segs[i + 1].start else Double.MAX_VALUE
+            var end = s.end
+            if (nextStart > s.start && end > nextStart - 0.05) end = nextStart - 0.05
+            if (end <= s.start) end = s.start + 0.5
+            sb.append(i + 1).append('\n')
+            sb.append(srtTime(s.start)).append(" --> ").append(srtTime(end)).append('\n')
+            if (s.speaker.isNotBlank()) sb.append(s.speaker).append(": ")
+            sb.append(s.ar).append('\n')
+            if (s.en.isNotBlank()) sb.append(s.en).append('\n')
+            sb.append('\n')
+        }
+        return sb.toString()
+    }
+
     fun formatText(segs: List<Segment>): String {
         val sb = StringBuilder()
         for (s in segs) {
@@ -130,12 +184,26 @@ object SessionStore {
 
     private fun dir(ctx: Context): File = File(ctx.filesDir, "sessions").also { it.mkdirs() }
 
-    fun save(ctx: Context, segs: List<Segment>, durationSec: Double, fp: LongArray): String {
+    fun save(ctx: Context, segs: List<Segment>, durationSec: Double, fp: LongArray, name: String? = null): String {
         val id = System.currentTimeMillis().toString()
         val stamp = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).format(Date())
-        val first = segs.firstOrNull { it.en.isNotBlank() }?.en?.take(28) ?: ""
+        val first = name?.take(40) ?: segs.firstOrNull { it.en.isNotBlank() }?.en?.take(28) ?: ""
         val title = if (first.isEmpty()) stamp else "$stamp · $first"
 
+        writeJson(ctx, id, title, durationSec, segs)
+
+        val bb = ByteBuffer.allocate(fp.size * 8)
+        bb.asLongBuffer().put(fp)
+        File(dir(ctx), "$id.fp").outputStream().use { it.write(bb.array()) }
+        return id
+    }
+
+    /** Saves edits (title or lines) of an existing session; its fingerprint is kept. */
+    fun update(ctx: Context, s: Session) {
+        writeJson(ctx, s.id, s.title, s.durationSec, s.segments)
+    }
+
+    private fun writeJson(ctx: Context, id: String, title: String, durationSec: Double, segs: List<Segment>) {
         val arr = JSONArray()
         for (s in segs) {
             arr.put(
@@ -147,11 +215,6 @@ object SessionStore {
         val root = JSONObject()
             .put("id", id).put("title", title).put("duration", durationSec).put("segments", arr)
         File(dir(ctx), "$id.json").writeText(root.toString())
-
-        val bb = ByteBuffer.allocate(fp.size * 8)
-        bb.asLongBuffer().put(fp)
-        File(dir(ctx), "$id.fp").outputStream().use { it.write(bb.array()) }
-        return id
     }
 
     fun list(ctx: Context): List<Session> {

@@ -13,7 +13,39 @@ android {
         minSdk = 29
         targetSdk = 34
         versionCode = 1
-        versionName = "1.0"
+        versionName = "1.1"
+
+        // whisper.cpp is built for 64-bit ARM phones only (all current phones)
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_static"
+            }
+        }
+    }
+
+    // A fixed key (created once by the GitHub workflow) so a new APK installs over the old one
+    // and the saved sessions survive updates. Without it Gradle uses a random per-machine debug key.
+    val fixedKey = rootProject.file("keystore/livetranslator.jks")
+    if (fixedKey.exists()) {
+        signingConfigs {
+            getByName("debug") {
+                storeFile = fixedKey
+                storePassword = "livetranslator"
+                keyAlias = "livetranslator"
+                keyPassword = "livetranslator"
+            }
+        }
+    }
+
+    ndkVersion = "26.1.10909125"
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     compileOptions {
@@ -23,6 +55,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 
     packaging {
@@ -39,4 +75,11 @@ dependencies {
 
     // On-device translation (English -> Arabic)
     implementation("com.google.mlkit:translate:17.0.3")
+
+    // WebSocket for the Gemini Live translation engine
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    testImplementation("junit:junit:4.13.2")
+    // the org.json in android.jar is only a stub in local unit tests
+    testImplementation("org.json:json:20240303")
 }

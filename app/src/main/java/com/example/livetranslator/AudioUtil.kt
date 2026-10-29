@@ -44,6 +44,28 @@ object AudioUtil {
         return wavHeader(len * 2) + data.array()
     }
 
+    /** Copies [startSec, endSec) of a 16 kHz mono WAV made by WavRecorder into a new WAV file. */
+    fun sliceWav(wav: File, startSec: Double, endSec: Double, out: File) {
+        RandomAccessFile(wav, "r").use { raf ->
+            val total = raf.length() - 44
+            val from = ((startSec * SAMPLE_RATE).toLong() * 2).coerceIn(0L, total)
+            val to = ((endSec * SAMPLE_RATE).toLong() * 2).coerceIn(from, total)
+            val len = to - from
+            raf.seek(44 + from)
+            out.outputStream().buffered().use { o ->
+                o.write(wavHeader(len.toInt()))
+                val buf = ByteArray(64 * 1024)
+                var left = len
+                while (left > 0) {
+                    val n = raf.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+                    if (n < 0) break
+                    o.write(buf, 0, n)
+                    left -= n
+                }
+            }
+        }
+    }
+
     /**
      * Copies the AAC audio track of a video/audio file into an .m4a file without re-encoding.
      * Returns false if the file has no AAC audio track (caller then uploads the original file).

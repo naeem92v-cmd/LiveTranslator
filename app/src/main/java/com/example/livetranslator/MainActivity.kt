@@ -12,12 +12,16 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.provider.OpenableColumns
+import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
 import android.widget.ScrollView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 
@@ -28,6 +32,7 @@ class MainActivity : Activity() {
         private const val REQ_OVERLAY = 2
         private const val REQ_PROJECTION = 3
         private const val REQ_PICK = 4
+        private val SUBTITLE_SIZES = intArrayOf(16, 20, 26)
     }
 
     private lateinit var status: TextView
@@ -39,6 +44,14 @@ class MainActivity : Activity() {
     private lateinit var engineGroup: RadioGroup
     private lateinit var radioGemini: RadioButton
     private lateinit var radioOffline: RadioButton
+    private lateinit var radioHybrid: RadioButton
+    private lateinit var radioStream: RadioButton
+    private lateinit var langSpinner: Spinner
+    private lateinit var radioWhisperBase: RadioButton
+    private lateinit var radioWhisperSmall: RadioButton
+    private val sizeButtons = ArrayList<RadioButton>()
+    private lateinit var arabicOnlyBox: CheckBox
+    private lateinit var glossaryInput: EditText
     private lateinit var sessionsBox: LinearLayout
     private lateinit var styleGroup: RadioGroup
     private val styleButtons = ArrayList<RadioButton>()
@@ -125,6 +138,15 @@ class MainActivity : Activity() {
         }
         root.addView(keyInput)
 
+        root.addView(label("لغة الفيديوهات (الترجمة دائماً إلى العربية)", 13f, 12))
+        langSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity, android.R.layout.simple_spinner_dropdown_item,
+                Languages.list.map { it.ar }
+            )
+        }
+        root.addView(langSpinner)
+
         root.addView(label("محرك الترجمة الحية", 13f, 12))
         engineGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
         radioGemini = RadioButton(this).apply {
@@ -135,13 +157,53 @@ class MainActivity : Activity() {
             id = View.generateViewId()
             text = "أوفلاين: Vosk + ML Kit (بدون إرسال الصوت)"
         }
+        radioHybrid = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "هجين: Whisper على الجهاز + ترجمة نصية (تجريبي)"
+        }
+        radioStream = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "Gemini بث مباشر (أسرع بكثير، تجريبي)"
+        }
         engineGroup.addView(radioGemini)
+        engineGroup.addView(radioStream)
+        engineGroup.addView(radioHybrid)
         engineGroup.addView(radioOffline)
         root.addView(engineGroup)
 
+        root.addView(label("حجم نموذج Whisper (للمحرك الهجين)", 13f, 12))
+        val whisperGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
+        radioWhisperBase = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "صغير ~60 MB (أسرع)"
+        }
+        radioWhisperSmall = RadioButton(this).apply {
+            id = View.generateViewId()
+            text = "متوسط ~190 MB (أدق، للهواتف القوية)"
+        }
+        whisperGroup.addView(radioWhisperBase)
+        whisperGroup.addView(radioWhisperSmall)
+        root.addView(whisperGroup)
+
+        root.addView(label("شريط الترجمة", 13f, 12))
+        val sizeGroup = RadioGroup(this).apply { orientation = RadioGroup.HORIZONTAL }
+        for ((i, n) in listOf("خط صغير", "متوسط", "كبير").withIndex()) {
+            val rb = RadioButton(this).apply {
+                id = View.generateViewId()
+                text = n
+                tag = SUBTITLE_SIZES[i]
+            }
+            sizeButtons.add(rb)
+            sizeGroup.addView(rb)
+        }
+        root.addView(sizeGroup)
+        arabicOnlyBox = CheckBox(this).apply { text = "العربي فقط (إخفاء النص الأصلي)" }
+        root.addView(arabicOnlyBox)
+
         root.addView(label("نوع ترجمة الملفات", 13f, 12))
         styleGroup = RadioGroup(this).apply { orientation = RadioGroup.VERTICAL }
-        val names = listOf("مفصلة كاملة", "مع الأوقات", "ملخص قصير")
+        // order must match the Style enum
+        val names = listOf("مفصلة كاملة", "مع الأوقات", "ملخص قصير", "جلسة متابعة (أوقات + بصمة، للمتابعة لاحقاً)")
         for (n in names) {
             val rb = RadioButton(this).apply {
                 id = View.generateViewId()
@@ -163,6 +225,15 @@ class MainActivity : Activity() {
         }
         root.addView(liveModelInput)
         root.addView(fileModelInput)
+
+        root.addView(label("قاموس المصطلحات: سطر لكل مصطلح بهذا الشكل  english = عربي", 13f, 12))
+        glossaryInput = EditText(this).apply {
+            hint = "renal impairment = قصور كلوي"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
+            minLines = 3
+            gravity = Gravity.TOP
+        }
+        root.addView(glossaryInput)
 
         val saveBtn = Button(this).apply {
             text = "حفظ الإعدادات"
@@ -226,9 +297,20 @@ class MainActivity : Activity() {
 
     private fun loadSettings() {
         keyInput.setText(Prefs.apiKey(this))
-        if (Prefs.liveEngine(this) == Prefs.ENGINE_OFFLINE) radioOffline.isChecked = true
-        else radioGemini.isChecked = true
+        glossaryInput.setText(Prefs.glossary(this))
+        when (Prefs.liveEngine(this)) {
+            Prefs.ENGINE_OFFLINE -> radioOffline.isChecked = true
+            Prefs.ENGINE_HYBRID -> radioHybrid.isChecked = true
+            Prefs.ENGINE_STREAM -> radioStream.isChecked = true
+            else -> radioGemini.isChecked = true
+        }
         styleButtons[Prefs.style(this).ordinal].isChecked = true
+        langSpinner.setSelection(Languages.list.indexOf(Languages.byCode(Prefs.sourceLang(this))).coerceAtLeast(0))
+        if (Prefs.whisperSize(this) == Prefs.WHISPER_SMALL) radioWhisperSmall.isChecked = true
+        else radioWhisperBase.isChecked = true
+        val size = Prefs.subtitleSize(this)
+        (sizeButtons.firstOrNull { it.tag == size } ?: sizeButtons[1]).isChecked = true
+        arabicOnlyBox.isChecked = Prefs.arabicOnly(this)
         val lm = Prefs.liveModel(this)
         val fm = Prefs.fileModel(this)
         if (lm != Prefs.DEFAULT_LIVE_MODEL) liveModelInput.setText(lm)
@@ -241,7 +323,12 @@ class MainActivity : Activity() {
     }
 
     private fun saveSettings() {
-        val engine = if (radioOffline.isChecked) Prefs.ENGINE_OFFLINE else Prefs.ENGINE_GEMINI
+        val engine = when {
+            radioOffline.isChecked -> Prefs.ENGINE_OFFLINE
+            radioHybrid.isChecked -> Prefs.ENGINE_HYBRID
+            radioStream.isChecked -> Prefs.ENGINE_STREAM
+            else -> Prefs.ENGINE_GEMINI
+        }
         Prefs.save(
             this,
             keyInput.text.toString(),
@@ -249,6 +336,14 @@ class MainActivity : Activity() {
             liveModelInput.text.toString(),
             fileModelInput.text.toString(),
             currentStyle()
+        )
+        Prefs.setGlossary(this, glossaryInput.text.toString())
+        val lang = Languages.list.getOrElse(langSpinner.selectedItemPosition) { Languages.list[1] }.code
+        val size = (sizeButtons.firstOrNull { it.isChecked }?.tag as? Int) ?: 20
+        Prefs.saveExtra(
+            this, lang,
+            if (radioWhisperSmall.isChecked) Prefs.WHISPER_SMALL else Prefs.WHISPER_BASE,
+            size, arabicOnlyBox.isChecked
         )
     }
 
@@ -284,8 +379,30 @@ class MainActivity : Activity() {
         }
 
         // 3) Engine requirements
-        if (radioGemini.isChecked && Prefs.apiKey(this).isBlank()) {
+        if ((radioGemini.isChecked || radioStream.isChecked) && Prefs.apiKey(this).isBlank()) {
             setStatus("أدخل مفتاح Gemini API في الإعدادات أو اختر الوضع الأوفلاين")
+            return
+        }
+        if (radioHybrid.isChecked && !WhisperBridge.available) {
+            setStatus("محرك Whisper غير مضمَّن في هذا الإصدار")
+            return
+        }
+        if (radioHybrid.isChecked && !ModelManager.isWhisperReady(this)) {
+            startBtn.isEnabled = false
+            Thread {
+                try {
+                    ModelManager.downloadWhisper(this) { msg -> postStatus(msg) }
+                    runOnUiThread {
+                        startBtn.isEnabled = true
+                        startFlow()
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread {
+                        startBtn.isEnabled = true
+                        setStatus("فشل تنزيل النموذج (تأكد من الإنترنت): ${e.message}")
+                    }
+                }
+            }.start()
             return
         }
         if (radioOffline.isChecked && !ModelManager.isReady(this)) {
@@ -375,14 +492,23 @@ class MainActivity : Activity() {
         setStatus("جاري البدء…")
 
         val app = applicationContext
+        val name = displayName(uri)
         Thread {
             try {
-                val text = FileTranslator.run(app, uri, null, style) { msg -> postStatus(msg) }
-                Notifier.result(app, "اكتملت الترجمة", text.take(120))
+                val result = Intent(this, ResultActivity::class.java)
+                if (style == Style.SESSION) {
+                    val id = FileTranslator.runSession(app, uri, name) { msg -> postStatus(msg) }
+                    result.putExtra(ResultActivity.EXTRA_SESSION, id)
+                    Notifier.result(app, "حُفظت الجلسة", name ?: "")
+                } else {
+                    val text = FileTranslator.run(app, uri, null, style) { msg -> postStatus(msg) }
+                    Notifier.result(app, "اكتملت الترجمة", text.take(120))
+                }
                 runOnUiThread {
                     setStatus("اكتملت الترجمة ✓")
                     if (!isDestroyed && !isFinishing) {
-                        startActivity(Intent(this, ResultActivity::class.java))
+                        refreshSessions()
+                        startActivity(result)
                     }
                 }
             } catch (e: Exception) {
@@ -392,6 +518,15 @@ class MainActivity : Activity() {
                 runOnUiThread { if (!isDestroyed) pickBtn.isEnabled = true }
             }
         }.start()
+    }
+
+    /** File name of a picked/shared file without its extension, used as the session title. */
+    private fun displayName(uri: Uri): String? = try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+            if (c.moveToFirst()) c.getString(0)?.substringBeforeLast('.') else null
+        }
+    } catch (_: Exception) {
+        null
     }
 
     @Deprecated("Deprecated in Java")

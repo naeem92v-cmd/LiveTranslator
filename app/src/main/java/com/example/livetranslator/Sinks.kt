@@ -38,25 +38,27 @@ class VoskSink(
 
 /**
  * Gemini engine: cuts the audio into chunks of about 3-9 seconds at pauses in speech,
- * sends each chunk to Gemini, and reports the English text plus the Arabic translation.
+ * sends each chunk to Gemini (with the previous clip as context), and reports the original text plus the Arabic translation.
  */
 class GeminiSink(
     private val apiKey: String,
     private val model: String,
+    sourceLang: String,
+    private val glossaryHint: String,
     private val onResult: (String, String) -> Unit,
     private val onError: (String) -> Unit
 ) : AudioSink {
 
-    companion object {
-        private const val PROMPT =
-            "This is a short audio clip from an English-language video. " +
-                "Transcribe what is said and translate it into Arabic. " +
-                "Reply in exactly two lines:\n" +
-                "EN: <what was said>\n" +
-                "AR: <Arabic translation>\n" +
-                "If there is no clear speech, reply with only: NONE"
-    }
+    private val basePrompt =
+        "This is a short audio clip from a video in ${Languages.promptName(sourceLang)}. " +
+            "Transcribe what is said and translate it into Arabic. " +
+            "Reply in exactly two lines:\n" +
+            "EN: <what was said, in the original language>\n" +
+            "AR: <Arabic translation>\n" +
+            "If there is no clear speech, reply with only: NONE"
 
+    /** The last clip's text: the clip may start mid-sentence, so the model gets it as context. */
+    @Volatile private var previous = ""
     private val sr = AudioUtil.SAMPLE_RATE
     private val maxLen = sr * 9
     private val minLen = sr * 3
@@ -99,12 +101,21 @@ class GeminiSink(
         pending.incrementAndGet()
         exec.execute {
             try {
+                val context = previous
+                val prompt = basePrompt +
+                    (if (context.isNotBlank()) {
+                        "\nThe previous clip said (context only, do not repeat or translate it): $context"
+                    } else "") +
+                    glossaryHint
                 val reply = GeminiClient.generate(
                     apiKey, model,
-                    listOf(Part.Text(PROMPT), Part.Inline(wav, "audio/wav"))
+                    listOf(Part.Text(prompt), Part.Inline(wav, "audio/wav"))
                 )
                 val parsed = parse(reply)
-                if (parsed != null) onResult(parsed.first, parsed.second)
+                if (parsed != null) {
+                    if (parsed.first.isNotBlank()) previous = parsed.first.takeLast(300)
+                    onResult(parsed.first, parsed.second)
+                }
             } catch (e: GeminiException) {
                 onError("Gemini: " + (e.message ?: "").take(90))
                 if (e.code == 429) {

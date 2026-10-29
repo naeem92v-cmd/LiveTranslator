@@ -82,6 +82,8 @@ class TranslatorService : Service() {
     // views
     private var wm: WindowManager? = null
     private var subtitleBox: View? = null
+    private var subtitleLp: WindowManager.LayoutParams? = null
+    private var arabicOnly = false
     private var bubble: View? = null
     private var menu: View? = null
     private lateinit var spView: TextView
@@ -147,10 +149,10 @@ class TranslatorService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (running) return START_NOT_STICKY
-
-        // Must be called right away, before touching MediaProjection (Android 14+)
+        // Must be called right away, before touching MediaProjection (Android 14+).
+        // Also when already running: every startForegroundService() needs a startForeground().
         startForegroundNow()
+        if (running) return START_NOT_STICKY
 
         val code = intent.getIntExtra(EXTRA_CODE, Activity.RESULT_CANCELED)
         @Suppress("DEPRECATION")
@@ -241,17 +243,20 @@ class TranslatorService : Service() {
             textDirection = View.TEXT_DIRECTION_RTL
             visibility = View.GONE
         }
+        val size = Prefs.subtitleSize(this).toFloat()
+        arabicOnly = Prefs.arabicOnly(this)
         arView = TextView(this).apply {
             setTextColor(Color.WHITE)
-            textSize = 20f
+            textSize = size
             gravity = Gravity.CENTER
             textDirection = View.TEXT_DIRECTION_RTL
             text = "جاهز"
         }
         enView = TextView(this).apply {
             setTextColor(0xFFAAAAAA.toInt())
-            textSize = 13f
+            textSize = size * 0.65f
             gravity = Gravity.CENTER
+            if (arabicOnly) visibility = View.GONE
         }
         box.addView(spView)
         box.addView(arView)
@@ -266,10 +271,28 @@ class TranslatorService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = (110 * dp).toInt()
+            y = (Prefs.subtitleOffsetDp(this@TranslatorService) * dp).toInt()
+            // Android 12+ blocks touches through untrusted overlays more opaque than 0.8
+            alpha = 0.8f
         }
         manager.addView(box, lp)
         subtitleBox = box
+        subtitleLp = lp
+    }
+
+    /** Moves the subtitle bar up (positive) or down by [deltaDp] and remembers the place. */
+    private fun moveSubtitles(deltaDp: Int) {
+        val box = subtitleBox ?: return
+        val lp = subtitleLp ?: return
+        val dp = resources.displayMetrics.density
+        val maxDp = (resources.displayMetrics.heightPixels / dp).toInt() - 120
+        val v = (Prefs.subtitleOffsetDp(this) + deltaDp).coerceIn(0, maxOf(maxDp, 0))
+        Prefs.setSubtitleOffsetDp(this, v)
+        lp.y = (v * dp).toInt()
+        try {
+            wm?.updateViewLayout(box, lp)
+        } catch (_: Exception) {
+        }
     }
 
     private fun setStatus(msg: String) {
@@ -283,12 +306,32 @@ class TranslatorService : Service() {
         main.post { setStatus(msg) }
     }
 
+    private fun showEnglishOnly(en: String) {
+        if (!liveWanted) return
+        spView.visibility = View.GONE
+        enView.text = en
+        // with "Arabic only" the original text still shows until its translation arrives
+        if (arabicOnly) arView.text = en
+        main.removeCallbacks(clearRunnable)
+        main.postDelayed(clearRunnable, 9000)
+    }
+
     private fun showPair(en: String, ar: String) {
         spView.visibility = View.GONE
         enView.text = en
         arView.text = ar
         main.removeCallbacks(clearRunnable)
         main.postDelayed(clearRunnable, 9000)
+    }
+
+    /** Streaming engine: the texts grow while the person speaks. */
+    private fun showStream(src: String, ar: String) {
+        if (!liveWanted) return
+        spView.visibility = View.GONE
+        enView.text = src
+        arView.text = if (ar.isNotBlank()) ar else if (arabicOnly) "…" else ""
+        main.removeCallbacks(clearRunnable)
+        main.postDelayed(clearRunnable, 7000)
     }
 
     private fun showSegment(seg: Segment, speakerIdx: Int) {
@@ -436,6 +479,8 @@ class TranslatorService : Service() {
             addItem("الترجمة أبكر (+0.5 ث)") { adjustSync(500) }
             addItem("الترجمة أبطأ (−0.5 ث)") { adjustSync(-500) }
         }
+        addItem("رفع شريط الترجمة ↑") { moveSubtitles(40) }
+        addItem("خفض شريط الترجمة ↓") { moveSubtitles(-40) }
         addItem("إيقاف التطبيق") { stopSelf() }
 
         val menuWidth = (190 * dp).toInt()
@@ -475,7 +520,7 @@ class TranslatorService : Service() {
         if (followWanted) stopFollow()
         val engine = Prefs.liveEngine(this)
         val key = Prefs.apiKey(this)
-        if (engine == Prefs.ENGINE_GEMINI && key.isBlank()) {
+        if ((engine == Prefs.ENGINE_GEMINI || engine == Prefs.ENGINE_STREAM) && key.isBlank()) {
             setStatus("أدخل مفتاح Gemini في التطبيق أو اختر الوضع الأوفلاين")
             return
         }
@@ -485,15 +530,47 @@ class TranslatorService : Service() {
         }
         liveWanted = true
         setStatus("جاري التحضير…")
-        if (engine == Prefs.ENGINE_OFFLINE) ensureTranslator()
+        if (engine == Prefs.ENGINE_HYBRID) {
+            if (!WhisperBridge.available) {
+                liveWanted = false
+                setStatus("محرك Whisper غير مضمَّن في هذا الإصدار")
+                return
+            }
+            if (!ModelManager.isWhisperReady(this)) {
+                liveWanted = false
+                setStatus("نزّل نموذج Whisper من داخل التطبيق أولاً")
+                return
+            }
+        }
+        val source = Prefs.sourceLang(this)
+        if (engine == Prefs.ENGINE_OFFLINE || engine == Prefs.ENGINE_HYBRID) ensureTranslator(source)
         val liveModel = Prefs.liveModel(this)
+        val hint = Prefs.glossaryHint(this)
+        if (engine == Prefs.ENGINE_OFFLINE && source != "en") {
+            Toast.makeText(this, "الوضع الأوفلاين يفهم الإنكليزية فقط", Toast.LENGTH_LONG).show()
+        }
 
         Thread {
             var sink: AudioSink? = null
             try {
-                sink = if (engine == Prefs.ENGINE_GEMINI) {
+                sink = if (engine == Prefs.ENGINE_HYBRID) {
+                    WhisperSink(
+                        ModelManager.whisperFile(this).absolutePath, source, key, liveModel, hint,
+                        Prefs.glossaryTerms(this),
+                        onEnglish = { en -> main.post { showEnglishOnly(en) } },
+                        onResult = { en, ar -> main.post { showPair(en, ar) } },
+                        onFallback = { en -> main.post { onOfflineSpeech(en, true) } },
+                        onError = { msg -> postStatus(msg) }
+                    )
+                } else if (engine == Prefs.ENGINE_STREAM) {
+                    LiveTranslateSink(
+                        key, Prefs.STREAM_MODEL,
+                        onText = { src, ar -> main.post { showStream(src, ar) } },
+                        onStatus = { msg -> postStatus(msg) }
+                    )
+                } else if (engine == Prefs.ENGINE_GEMINI) {
                     GeminiSink(
-                        key, liveModel,
+                        key, liveModel, source, hint,
                         onResult = { en, ar -> main.post { showPair(en, ar) } },
                         onError = { msg -> postStatus(msg) }
                     )
@@ -532,10 +609,12 @@ class TranslatorService : Service() {
         main.postDelayed(clearRunnable, 2500)
     }
 
-    private fun ensureTranslator() {
+    private fun ensureTranslator(source: String) {
         if (translator != null) return
+        // ML Kit needs a fixed source language; "auto" falls back to English
+        val mlSource = TranslateLanguage.fromLanguageTag(source) ?: TranslateLanguage.ENGLISH
         val options = TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.ENGLISH)
+            .setSourceLanguage(mlSource)
             .setTargetLanguage(TranslateLanguage.ARABIC)
             .build()
         val tr = Translation.getClient(options)
@@ -620,7 +699,7 @@ class TranslatorService : Service() {
         setStatus("جاري التحليل والترجمة…")
         Thread {
             try {
-                val raw = FileTranslator.runSegments(this, f) { msg -> postStatus(msg) }
+                val raw = FileTranslator.runSegments(this, f, seconds, onsets) { msg -> postStatus(msg) }
                 val segs = SegmentTools.snap(raw, onsets)
                 SessionStore.save(this, segs, seconds, fpArray)
                 val text = SegmentTools.formatText(segs)
